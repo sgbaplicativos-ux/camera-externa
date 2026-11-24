@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<!--
+ MÓDULO OPCIONAL DE CÂMERA AO VIVO (PUBLICAR EM HOSPEDAGEM HTTPS SEPARADA).
+ Google Apps Script HTMLService pode bloquear getUserMedia por Permissions Policy.
+ Este HTML deve ser disponibilizado numa origem HTTPS (ex.: GitHub Pages institucional).
+ Não recebe RE, token, SISPEC nem arquivo em servidor externo; somente envia a foto
+ por postMessage à janela que abriu o módulo.
+
+ Enquadramento verde: heurística luminosa para papel claro em FUNDO ESCURO.
+ Não é reconhecimento documental nem garantia de integridade/legibilidade.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111827">
+<title>Câmera de documentos • 1º SGB • v2.7</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b101b;color:#fff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.camera{height:100dvh;display:flex;flex-direction:column}
+.top{padding:17px 15px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px}.title{font-size:16px;font-weight:850}.desc{font-size:12px;color:#cbd5e1;margin-top:4px}.back{background:#263142;color:#fff;border:1px solid #475569;border-radius:10px;padding:11px 14px;font-size:12px;font-weight:800}
+.stage{container-type:size;position:relative;flex:1;min-height:200px;overflow:hidden;background:#030712;display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:cover;position:absolute;inset:0}.shade{position:absolute;inset:0;background:#0004;pointer-events:none}
+.frame{position:relative;width: min(82vw, 400px);aspect-ratio:0.707;border:4px solid #ef4444;border-radius:12px;box-shadow:0 0 0 999px #0003,0 0 18px #ef444455;transition:border-color .22s,box-shadow .22s;pointer-events:none}
+.frame.good{border-color:#22c55e;box-shadow:0 0 0 999px #0002,0 0 24px #22c55e88}.cross{display:none}.frame{width:min(86cqw, calc(92cqh * .707));flex:none}.shade{display:none}
+.lower{padding:13px 15px max(18px,env(safe-area-inset-bottom));background:#111827}.status{font-size:12px;color:#fda4af;font-weight:850;margin-bottom:11px;text-align:center;min-height:22px}.status.good{color:#86efac}
+.capture{width:100%;min-height:52px;border:0;border-radius:13px;background:#ef4444;color:white;font-size:16px;font-weight:900;cursor:pointer}.capture:disabled{opacity:.4;cursor:not-allowed}.capture.good{background:#16a34a}
+.tip{text-align:center;color:#cbd5e1;font-size:11px;line-height:1.45;margin-top:8px}
+.error{position:absolute;left:12px;right:12px;top:40%;border:1px solid #fecaca;border-radius:14px;background:#fff;color:#991b1b;padding:18px;line-height:1.5;text-align:center;font-weight:750;font-size:13px}
+.tools{display:flex;gap:6px;align-items:center;flex-shrink:0}.torch{background:#263142;color:white;border:1px solid #475569;border-radius:10px;padding:11px;font-size:12px;font-weight:750}.torch[aria-pressed="true"]{background:#facc15;color:#111827}.torch:disabled{opacity:.45}.torch[hidden]{display:none}.top{flex-wrap:wrap}.top>div:first-child{flex:1;min-width:140px}
+</style>
+</head>
+<body>
+<div class="camera">
+ <div class="top"><div><div class="title" id="titulo">Fotografar a frente</div><div class="desc">Deixe as quatro bordas da folha visíveis dentro do quadro.</div></div><div class="tools"><button class="torch" id="flash" type="button" aria-pressed="false" hidden>⚡ Flash</button><button class="back" id="cancelar">Voltar</button></div></div>
+ <div class="stage" id="stage"><video id="video" autoplay playsinline muted></video><div class="shade"></div><div class="frame" id="frame"><div class="cross"></div></div><div class="error" id="erro" style="display:none"></div></div>
+ <div class="lower"><div class="status" id="status">Preparando câmera...</div><button id="capturar" class="capture" disabled>Capturar foto</button><div class="tip">Use fundo escuro. Se disponível, ligue o flash para reduzir sombras; evite reflexos.</div></div>
+</div>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),p=new URLSearchParams(location.search);
+const etapa=p.get('etapa')==='verso'?'verso':'frente';
+const nonce=p.get('nonce')||'';
+const origem=p.get('origem')||'';
+const origemAutorizada=/^https:\/\/(?:script\.google\.com|[a-z0-9-]+\.googleusercontent\.com)$/.test(origem);
+let stream=null,estaveis=0,ativo=true,ultimo=0,emProcessamento=false;
+$('titulo').textContent=etapa==='verso'?'Fotografar o verso':'Fotografar a frente';
+const canvas=document.createElement('canvas');const ctx=canvas.getContext('2d',{willReadFrequently:true});
+function avisarFalha(){if(origemAutorizada && window.opener){window.opener.postMessage({tipo:'SGB_CAMERA_FALHA',nonce,etapa},origem);}}
+function parar(){ativo=false;if(stream)for(const tr of stream.getTracks())tr.stop();stream=null;}
+$('cancelar').onclick=()=>{parar();window.close();};
+window.addEventListener('pagehide',parar);
+function status(texto,ok){$('status').textContent=texto;$('status').classList.toggle('good',!!ok);$('frame').classList.toggle('good',!!ok);$('capturar').classList.toggle('good',!!ok);$('capturar').disabled=!ok;}
+function falha(texto){$('erro').style.display='block';$('erro').textContent=texto+' Feche esta aba, permita o acesso à câmera e tente novamente.';status('Câmera indisponível',false);avisarFalha();parar();}
+// Mapeia um pixel da tela de vídeo (object-fit: cover) para o vídeo original.
+function parametrosVideo(){const vid=$('video'),box=$('stage').getBoundingClientRect();const vw=vid.videoWidth,vh=vid.videoHeight;
+ if(!vw||!vh||!box.width||!box.height)return null;
+ const scale=Math.max(box.width/vw,box.height/vh),sourceW=box.width/scale,sourceH=box.height/scale;
+ return {box,vw,vh,sx:(vw-sourceW)/2,sy:(vh-sourceH)/2,sourceW,sourceH};}
+function luminancia(data,idx){return (.2126*data[idx]+.7152*data[idx+1]+.0722*data[idx+2]);}
+// Segmentação adaptativa: procura componentes claros conectados, não pixels isolados.
+function detectarPapel(gray,w,h,f){
+ const {xl,xr,yt,yb}=f,fw=xr-xl,fh=yb-yt;
+ if(fw<40||fh<40)return false;
+ // Search for a sustained light-to-dark transition along each side, independent of shadows inside the page.
+ function candidatos(vertical,sign,lo,hi,start,end){
+   const out=[];const dim=vertical?w:h, along=vertical?h:w;
+   const pixel=(x,y)=>vertical?gray[y*w+x]:gray[x*w+y];
+   for(let x=Math.max(4,Math.ceil(lo));x<=Math.min(dim-5,Math.floor(hi));x++){
+     let ok=0,sum=0,n=0;
+     for(let y=Math.max(2,Math.round(start));y<=Math.min(along-3,Math.round(end));y+=2){
+       let best=-100;
+       for(let d=-2;d<=2;d++){
+         const z=x+d;
+         const delta=(pixel(z+sign,y)+pixel(z+2*sign,y)-pixel(z-sign,y)-pixel(z-2*sign,y))/2;
+         best=Math.max(best,delta);
+       }
+       n++;if(best>=12)ok++;sum+=Math.max(0,Math.min(75,best));
+     }
+     if(n&&ok/n>=.49)out.push({x,score:sum/n,coverage:ok/n});
+   }
+   out.sort((a,b)=>b.score-a.score);const distinct=[];
+   for(const c of out)if(distinct.every(v=>Math.abs(v.x-c.x)>3)){distinct.push(c);if(distinct.length===6)break;}
+   return distinct;
+ }
+ const L=candidatos(true,1,xl+1,xl+fw*.24,yt+fh*.25,yb-fh*.25);
+ const R=candidatos(true,-1,xr-fw*.24,xr-1,yt+fh*.25,yb-fh*.25);
+ const T=candidatos(false,1,yt+1,yt+fh*.24,xl+fw*.25,xr-fw*.25);
+ const B=candidatos(false,-1,yb-fh*.24,yb-1,xl+fw*.25,xr-fw*.25);
+ for(const l of L)for(const r of R)for(const t of T)for(const b of B){
+   const bw=r.x-l.x,bh=b.x-t.x,ratio=bw/bh;
+   if(bw<fw*.60||bh<fh*.60||ratio<.52||ratio>.90)continue;
+   if(Math.abs((l.x+r.x-xl-xr)/2)>fw*.13||Math.abs((t.x+b.x-yt-yb)/2)>fh*.13)continue;
+   // Verify the proposed borders across most of the actual document, including near its corners.
+   const sides=[[true,1,l.x,t.x,b.x],[true,-1,r.x,t.x,b.x],[false,1,t.x,l.x,r.x],[false,-1,b.x,l.x,r.x]];
+   let valid=true;
+   for(const [v,sign,pos,a,z] of sides){
+     let n=0,ok=0;const pix=(x,y)=>v?gray[y*w+x]:gray[x*w+y];
+     for(let y=Math.round(a+(z-a)*.08);y<=z-(z-a)*.08;y+=3){
+       let best=-100;
+       for(let d=-3;d<=3;d++){
+         const x=pos+d,dim=v?w:h;if(x<3||x>=dim-3)continue;
+         best=Math.max(best,(pix(x+sign,y)+pix(x+2*sign,y)-pix(x-sign,y)-pix(x-2*sign,y))/2);
+       }
+       n++;if(best>=10)ok++;
+     }
+     if(!n||ok/n<.55){valid=false;break;}
+   }
+   if(valid)return true;
+ }
+ return false;
+}
+function testeEnquadramento(){const prm=parametrosVideo();if(!prm)return false;
+ const largura=240,altura=Math.max(100,Math.round(largura*prm.box.height/prm.box.width));
+ if(canvas.width!==largura||canvas.height!==altura){canvas.width=largura;canvas.height=altura;}
+ ctx.drawImage($('video'),prm.sx,prm.sy,prm.sourceW,prm.sourceH,0,0,largura,altura);
+ const dados=ctx.getImageData(0,0,largura,altura).data,frame=$('frame').getBoundingClientRect(),gray=new Uint8Array(largura*altura);
+ for(let i=0;i<gray.length;i++)gray[i]=luminancia(dados,i*4);
+ return detectarPapel(gray,largura,altura,{xl:(frame.left-prm.box.left)/prm.box.width*largura,xr:(frame.right-prm.box.left)/prm.box.width*largura,yt:(frame.top-prm.box.top)/prm.box.height*altura,yb:(frame.bottom-prm.box.top)/prm.box.height*altura});
+}
+let flashLigado=false,alterandoFlash=false;
+function prepararFlash(){
+ const track=stream?.getVideoTracks()[0];const cap=track?.getCapabilities?.();
+ if(!cap?.torch)return;
+ const btn=$('flash');btn.hidden=false;
+ btn.onclick=async()=>{if(alterandoFlash||!ativo)return;alterandoFlash=true;btn.disabled=true;
+ try{const novo=!flashLigado;await track.applyConstraints({advanced:[{torch:novo}]});
+ const atual=track.getSettings?.().torch;flashLigado=typeof atual==='boolean'?atual:novo;
+ btn.setAttribute('aria-pressed',String(flashLigado));btn.textContent=flashLigado?'⚡ Ligado':'⚡ Flash';
+ estaveis=0;status('Aguarde o ajuste da iluminação',false);
+ }catch(e){btn.textContent='Flash indisponível';btn.hidden=true;}
+ finally{alterandoFlash=false;btn.disabled=false;}};
+}
+async function iniciar(){if(!origemAutorizada||!/^[-0-9a-fA-F]{36}$/.test(nonce))return falha('Origem da solicitação inválida.');
+ if(!navigator.mediaDevices?.getUserMedia)return falha('Este navegador não permite câmera ao vivo.');
+ try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:960}}});
+   $('video').srcObject=stream;await $('video').play();prepararFlash();status('Ajuste a folha no quadro vermelho',false);requestAnimationFrame(analisar);
+ }catch(e){falha('Permissão de câmera negada ou indisponível.');}}
+function analisar(t){if(!ativo)return;requestAnimationFrame(analisar);if(t-ultimo<290||emProcessamento||alterandoFlash)return;ultimo=t;
+ try{emProcessamento=true;const bom=testeEnquadramento();estaveis=bom?Math.min(5,estaveis+1):0;
+   status(estaveis>=3?'Quadro verde • pode fotografar':'Mantenha a folha inteira no quadro, com fundo escuro',estaveis>=3);
+ }catch(e){estaveis=0;status('Ajuste o documento e a iluminação',false);}finally{emProcessamento=false;}}
+$('capturar').onclick=()=>{
+ if(estaveis<3||!stream)return;
+ if(!testeEnquadramento()){estaveis=0;status("Reposicione a folha no quadro",false);return;}
+ try{const p=parametrosVideo(),f=$('frame').getBoundingClientRect();
+  const sx=p.sx+(f.left-p.box.left)/p.box.width*p.sourceW;
+  const sy=p.sy+(f.top-p.box.top)/p.box.height*p.sourceH;
+  const sw=f.width/p.box.width*p.sourceW,sh=f.height/p.box.height*p.sourceH;
+  const c=document.createElement('canvas');const mul=Math.min(1,1550/Math.max(sw,sh));c.width=Math.max(1,Math.round(sw*mul));c.height=Math.max(1,Math.round(sh*mul));
+  const g=c.getContext('2d',{alpha:false});g.drawImage($('video'),sx,sy,sw,sh,0,0,c.width,c.height);
+  let imagem=c.toDataURL('image/jpeg',.79);if(imagem.length>3900000)imagem=c.toDataURL('image/jpeg',.63);
+  if(imagem.length>3900000)throw new Error('Imagem grande demais.');
+  if(!window.opener)throw new Error('Janela de origem indisponível.');
+  window.opener.postMessage({tipo:'SGB_CAMERA_FOTO',nonce,etapa,imagem},origem);parar();window.close();
+ }catch(e){status('Falha ao capturar: tente novamente',false);}
+};
+iniciar();
+</script>
+</body>
+</html>
