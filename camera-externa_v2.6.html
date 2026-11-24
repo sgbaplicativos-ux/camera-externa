@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<!--
+ MÓDULO OPCIONAL DE CÂMERA AO VIVO (PUBLICAR EM HOSPEDAGEM HTTPS SEPARADA).
+ Google Apps Script HTMLService pode bloquear getUserMedia por Permissions Policy.
+ Este HTML deve ser disponibilizado numa origem HTTPS (ex.: GitHub Pages institucional).
+ Não recebe RE, token, SISPEC nem arquivo em servidor externo; somente envia a foto
+ por postMessage à janela que abriu o módulo.
+
+ Enquadramento verde: heurística luminosa para papel claro em FUNDO ESCURO.
+ Não é reconhecimento documental nem garantia de integridade/legibilidade.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111827">
+<title>Câmera de documentos • 1º SGB • v2.6</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b101b;color:#fff;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.camera{height:100dvh;display:flex;flex-direction:column}
+.top{padding:17px 15px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px}.title{font-size:16px;font-weight:850}.desc{font-size:12px;color:#cbd5e1;margin-top:4px}.back{background:#263142;color:#fff;border:1px solid #475569;border-radius:10px;padding:11px 14px;font-size:12px;font-weight:800}
+.stage{container-type:size;position:relative;flex:1;min-height:200px;overflow:hidden;background:#030712;display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:cover;position:absolute;inset:0}.shade{position:absolute;inset:0;background:#0004;pointer-events:none}
+.frame{position:relative;width: min(82vw, 400px);aspect-ratio:0.707;border:4px solid #ef4444;border-radius:12px;box-shadow:0 0 0 999px #0003,0 0 18px #ef444455;transition:border-color .22s,box-shadow .22s;pointer-events:none}
+.frame.good{border-color:#22c55e;box-shadow:0 0 0 999px #0002,0 0 24px #22c55e88}.cross{display:none}.frame{width:min(86cqw, calc(92cqh * .707));flex:none}.shade{display:none}
+.lower{padding:13px 15px max(18px,env(safe-area-inset-bottom));background:#111827}.status{font-size:12px;color:#fda4af;font-weight:850;margin-bottom:11px;text-align:center;min-height:22px}.status.good{color:#86efac}
+.capture{width:100%;min-height:52px;border:0;border-radius:13px;background:#ef4444;color:white;font-size:16px;font-weight:900;cursor:pointer}.capture:disabled{opacity:.4;cursor:not-allowed}.capture.good{background:#16a34a}
+.tip{text-align:center;color:#cbd5e1;font-size:11px;line-height:1.45;margin-top:8px}
+.error{position:absolute;left:12px;right:12px;top:40%;border:1px solid #fecaca;border-radius:14px;background:#fff;color:#991b1b;padding:18px;line-height:1.5;text-align:center;font-weight:750;font-size:13px}
+</style>
+</head>
+<body>
+<div class="camera">
+ <div class="top"><div><div class="title" id="titulo">Fotografar a frente</div><div class="desc">Deixe as quatro bordas da folha visíveis dentro do quadro.</div></div><button class="back" id="cancelar">Voltar</button></div>
+ <div class="stage" id="stage"><video id="video" autoplay playsinline muted></video><div class="shade"></div><div class="frame" id="frame"><div class="cross"></div></div><div class="error" id="erro" style="display:none"></div></div>
+ <div class="lower"><div class="status" id="status">Preparando câmera...</div><button id="capturar" class="capture" disabled>Capturar foto</button><div class="tip">Use fundo escuro e iluminação uniforme. Aguarde o quadro verde.</div></div>
+</div>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),p=new URLSearchParams(location.search);
+const etapa=p.get('etapa')==='verso'?'verso':'frente';
+const nonce=p.get('nonce')||'';
+const origem=p.get('origem')||'';
+const origemAutorizada=/^https:\/\/(?:script\.google\.com|[a-z0-9-]+\.googleusercontent\.com)$/.test(origem);
+let stream=null,estaveis=0,ativo=true,ultimo=0,emProcessamento=false;
+$('titulo').textContent=etapa==='verso'?'Fotografar o verso':'Fotografar a frente';
+const canvas=document.createElement('canvas');const ctx=canvas.getContext('2d',{willReadFrequently:true});
+function avisarFalha(){if(origemAutorizada && window.opener){window.opener.postMessage({tipo:'SGB_CAMERA_FALHA',nonce,etapa},origem);}}
+function parar(){ativo=false;if(stream)for(const tr of stream.getTracks())tr.stop();stream=null;}
+$('cancelar').onclick=()=>{parar();window.close();};
+window.addEventListener('pagehide',parar);
+function status(texto,ok){$('status').textContent=texto;$('status').classList.toggle('good',!!ok);$('frame').classList.toggle('good',!!ok);$('capturar').classList.toggle('good',!!ok);$('capturar').disabled=!ok;}
+function falha(texto){$('erro').style.display='block';$('erro').textContent=texto+' Feche esta aba, permita o acesso à câmera e tente novamente.';status('Câmera indisponível',false);avisarFalha();parar();}
+// Mapeia um pixel da tela de vídeo (object-fit: cover) para o vídeo original.
+function parametrosVideo(){const vid=$('video'),box=$('stage').getBoundingClientRect();const vw=vid.videoWidth,vh=vid.videoHeight;
+ if(!vw||!vh||!box.width||!box.height)return null;
+ const scale=Math.max(box.width/vw,box.height/vh),sourceW=box.width/scale,sourceH=box.height/scale;
+ return {box,vw,vh,sx:(vw-sourceW)/2,sy:(vh-sourceH)/2,sourceW,sourceH};}
+function luminancia(data,idx){return (.2126*data[idx]+.7152*data[idx+1]+.0722*data[idx+2]);}
+// Segmentação adaptativa: procura componentes claros conectados, não pixels isolados.
+function detectarPapel(gray,w,h,f){
+ const {xl,xr,yt,yb}=f,fw=xr-xl,fh=yb-yt;
+ if(fw<40||fh<40)return false;
+ const bg=[], centro=[];
+ for(let y=2;y<h-2;y+=4)for(let x=2;x<w-2;x+=4){
+   if(x<xl-3||x>xr+3||y<yt-3||y>yb+3)bg.push(gray[y*w+x]);
+   else if(x>xl+fw*.22&&x<xr-fw*.22&&y>yt+fh*.22&&y<yb-fh*.22)centro.push(gray[y*w+x]);
+ }
+ if(!bg.length||!centro.length)return false;
+ const q=(a,p)=>{a.sort((x,y)=>x-y);return a[Math.floor((a.length-1)*p)];};
+ const fundo=q(bg,.45),papel=q(centro,.75);
+ if(papel-fundo<12)return false;
+ const base=fundo+Math.max(9,(papel-fundo)*.22);
+ const mask=new Uint8Array(w*h), seen=new Uint8Array(w*h),queue=new Int32Array(w*h);
+ for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
+   const i=y*w+x;let soma=0;
+   for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++)soma+=gray[i+dy*w+dx];
+   mask[i]=soma/9>=base?1:0;
+ }
+ let melhor=null;
+ for(let i=0;i<mask.length;i++){
+   if(!mask[i]||seen[i])continue;
+   let n=1,k=0,minX=w,maxX=0,minY=h,maxY=0,cx=0,cy=0;queue[0]=i;seen[i]=1;
+   while(k<n){const j=queue[k++],x=j%w,y=(j/w)|0;
+     minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);cx+=x;cy+=y;
+     for(const z of [j-1,j+1,j-w,j+w])if(z>=0&&z<mask.length&&mask[z]&&!seen[z]){seen[z]=1;queue[n++]=z;}
+   }
+   const bw=maxX-minX+1,bh=maxY-minY+1,ratio=bw/bh;
+   if(bw<fw*.56||bh<fh*.56||ratio<.50||ratio>.92||n/(bw*bh)<.40)continue;
+   // Folha deve estar integralmente na área visível e dentro do quadro.
+   if(minX<2||minY<2||maxX>w-3||maxY>h-3)continue;
+   if(minX<xl+1||maxX>xr-1||minY<yt+1||maxY>yb-1)continue;
+   if(Math.abs((minX+maxX)/2-(xl+xr)/2)>fw*.18||Math.abs((minY+maxY)/2-(yt+yb)/2)>fh*.18)continue;
+   // Confirma contraste nas quatro bordas; tolera sombra e texto impresso.
+   let bordas=0;
+   for(const lado of [0,1,2,3]){let ok=0,total=0;
+     for(let t=.15;t<=.85;t+=.07){let x,y,dx,dy;
+       if(lado<2){x=lado===0?minX:maxX;y=Math.round(minY+t*(bh-1));dx=lado===0?1:-1;dy=0;}
+       else{x=Math.round(minX+t*(bw-1));y=lado===2?minY:maxY;dx=0;dy=lado===2?1:-1;}
+       let melhorDelta=0;
+       for(let d=-3;d<=3;d++){const a=x+dx*(d+2),b=y+dy*(d+2),c=x+dx*(d-2),e=y+dy*(d-2);
+         if(a>=0&&a<w&&b>=0&&b<h&&c>=0&&c<w&&e>=0&&e<h)melhorDelta=Math.max(melhorDelta,gray[b*w+a]-gray[e*w+c]);}
+       total++;if(melhorDelta>=Math.max(7,(papel-fundo)*.12))ok++;
+     }if(ok>=total*.30)bordas++;
+   }
+   if(bordas<4)continue;
+   if(!melhor||n>melhor.n)melhor={n,minX,maxX,minY,maxY};
+ }
+ return !!melhor;
+}
+function testeEnquadramento(){const prm=parametrosVideo();if(!prm)return false;
+ const largura=180,altura=Math.max(100,Math.round(largura*prm.box.height/prm.box.width));
+ if(canvas.width!==largura||canvas.height!==altura){canvas.width=largura;canvas.height=altura;}
+ ctx.drawImage($('video'),prm.sx,prm.sy,prm.sourceW,prm.sourceH,0,0,largura,altura);
+ const dados=ctx.getImageData(0,0,largura,altura).data,frame=$('frame').getBoundingClientRect(),gray=new Uint8Array(largura*altura);
+ for(let i=0;i<gray.length;i++)gray[i]=luminancia(dados,i*4);
+ return detectarPapel(gray,largura,altura,{xl:(frame.left-prm.box.left)/prm.box.width*largura,xr:(frame.right-prm.box.left)/prm.box.width*largura,yt:(frame.top-prm.box.top)/prm.box.height*altura,yb:(frame.bottom-prm.box.top)/prm.box.height*altura});
+}
+async function iniciar(){if(!origemAutorizada||!/^[-0-9a-fA-F]{36}$/.test(nonce))return falha('Origem da solicitação inválida.');
+ if(!navigator.mediaDevices?.getUserMedia)return falha('Este navegador não permite câmera ao vivo.');
+ try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:960}}});
+   $('video').srcObject=stream;await $('video').play();status('Ajuste a folha no quadro vermelho',false);requestAnimationFrame(analisar);
+ }catch(e){falha('Permissão de câmera negada ou indisponível.');}}
+function analisar(t){if(!ativo)return;requestAnimationFrame(analisar);if(t-ultimo<290||emProcessamento)return;ultimo=t;
+ try{emProcessamento=true;const bom=testeEnquadramento();estaveis=bom?Math.min(5,estaveis+1):0;
+   status(estaveis>=3?'Quadro verde • pode fotografar':'Deixe uma pequena margem entre a folha e o quadro',estaveis>=3);
+ }catch(e){estaveis=0;status('Ajuste o documento e a iluminação',false);}finally{emProcessamento=false;}}
+$('capturar').onclick=()=>{
+ if(estaveis<3||!stream)return;
+ if(!testeEnquadramento()){estaveis=0;status("Reposicione a folha no quadro",false);return;}
+ try{const p=parametrosVideo(),f=$('frame').getBoundingClientRect();
+  const sx=p.sx+(f.left-p.box.left)/p.box.width*p.sourceW;
+  const sy=p.sy+(f.top-p.box.top)/p.box.height*p.sourceH;
+  const sw=f.width/p.box.width*p.sourceW,sh=f.height/p.box.height*p.sourceH;
+  const c=document.createElement('canvas');const mul=Math.min(1,1550/Math.max(sw,sh));c.width=Math.max(1,Math.round(sw*mul));c.height=Math.max(1,Math.round(sh*mul));
+  const g=c.getContext('2d',{alpha:false});g.drawImage($('video'),sx,sy,sw,sh,0,0,c.width,c.height);
+  let imagem=c.toDataURL('image/jpeg',.79);if(imagem.length>3900000)imagem=c.toDataURL('image/jpeg',.63);
+  if(imagem.length>3900000)throw new Error('Imagem grande demais.');
+  if(!window.opener)throw new Error('Janela de origem indisponível.');
+  window.opener.postMessage({tipo:'SGB_CAMERA_FOTO',nonce,etapa,imagem},origem);parar();window.close();
+ }catch(e){status('Falha ao capturar: tente novamente',false);}
+};
+iniciar();
+</script>
+</body>
+</html>
